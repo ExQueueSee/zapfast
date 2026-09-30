@@ -1509,8 +1509,15 @@ impl Worker {
             // Every address the host resolves to is dialed, not only the first
             // one, so a network whose IPv6 does not answer still links over
             // IPv4 (#212).
-            None => builder
-                .with_transport_factory(crate::transport::HappyEyeballsTransportFactory::new()),
+            None => {
+                let builder = builder
+                    .with_transport_factory(crate::transport::HappyEyeballsTransportFactory::new());
+                #[cfg(windows)]
+                let builder = builder.with_http_client(
+                    whatsapp_rust::http::UreqHttpClient::with_agent(crate::proxy::agent()),
+                );
+                builder
+            }
         };
         let bot = builder
             // WhatsApp reads the linked-device name, version, and icon at pairing.

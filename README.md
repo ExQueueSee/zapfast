@@ -337,6 +337,9 @@ See **[zapfast.rocks](https://zapfast.rocks)** for downloads and guides.
   restart. With a proxy configured, ZapFast dials the proxy instead:
   `socks5h://` and `http://` proxies resolve WhatsApp's host themselves, and
   `socks5://` hands the proxy the first address this computer resolves.
+- **Uses Windows certificate trust.** On Windows, WhatsApp HTTPS and WebSocket
+  connections validate certificates against Windows trust settings, including
+  trusted enterprise roots on networks that inspect TLS traffic.
 - **Reconnects after sleep.** After the computer wakes from sleep, or when the
   connection has received nothing for two minutes, ZapFast reconnects and
   fetches what arrived meanwhile, instead of waiting on a connection that

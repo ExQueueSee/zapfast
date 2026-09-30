@@ -19,10 +19,39 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::net::TcpStream;
+#[cfg(not(windows))]
+use whatsapp_rust::transport::default_tls_connector;
 use whatsapp_rust::transport::{
-    Connector, Transport, TransportEvent, TransportFactory, default_tls_connector, from_websocket,
+    Connector, Transport, TransportEvent, TransportFactory, from_websocket,
 };
 use whatsapp_rust::wacore::net::{WHATSAPP_WEB_ORIGIN, WHATSAPP_WEB_WS_URL};
+
+/// Uses the Windows trust policy for connections intercepted by a trusted
+/// enterprise root. Other platforms retain the library's default connector.
+fn tls_connector() -> Result<Connector, String> {
+    #[cfg(windows)]
+    {
+        use rustls_platform_verifier::BuilderVerifierExt;
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| error.to_string())?
+            .with_platform_verifier()
+            .map_err(|error| error.to_string())?
+            .with_no_client_auth();
+        // Match whatsapp-rust's single-host TLS session cache.
+        config.resumption = rustls::client::Resumption::in_memory_sessions(16);
+        Ok(Connector::Rustls(tokio_rustls::TlsConnector::from(
+            Arc::new(config),
+        )))
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(default_tls_connector())
+    }
+}
 
 /// How long one address gets before the next one is tried, as RFC 8305 asks.
 ///
@@ -190,7 +219,7 @@ pub struct HappyEyeballsTransportFactory {
     /// outlives a reconnect. A fresh connector per dial leaves that store
     /// permanently empty and resumption can never fire, which is why the
     /// Tokio factory keeps one too.
-    connector: OnceLock<Connector>,
+    connector: OnceLock<Result<Connector, String>>,
 }
 
 impl HappyEyeballsTransportFactory {
@@ -245,22 +274,25 @@ pub type Link = (
 /// session store inside it outlives a reconnect. `via` names the path in an
 /// error, such as "to 157.240.0.1:443" or "through the proxy".
 pub async fn websocket(
-    connector: &OnceLock<Connector>,
+    connector: &OnceLock<Result<Connector, String>>,
     uri: http::Uri,
     host: &str,
     stream: TcpStream,
     via: &str,
 ) -> Result<Link, anyhow::Error> {
-    let stream = connector
-        .get_or_init(default_tls_connector)
-        .wrap(host, stream)
-        .await
+    let connector = connector
+        .get_or_init(tls_connector)
+        .as_ref()
         .map_err(|error| {
-            // The library's own line about this is reduced to a category, so
-            // the TLS error itself is kept here, under our own target.
-            log::warn!("TLS {via} failed: {error}");
-            anyhow::anyhow!("TLS {via} failed: {error}")
+            log::warn!("TLS {via} configuration failed: {error}");
+            anyhow::anyhow!("TLS {via} configuration failed: {error}")
         })?;
+    let stream = connector.wrap(host, stream).await.map_err(|error| {
+        // The library's own line about this is reduced to a category, so
+        // the TLS error itself is kept here, under our own target.
+        log::warn!("TLS {via} failed: {error}");
+        anyhow::anyhow!("TLS {via} failed: {error}")
+    })?;
     let (ws, _) = tokio_websockets::ClientBuilder::from_uri(uri)
         .add_header(
             http::header::ORIGIN,
@@ -282,6 +314,12 @@ mod tests {
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_connector_builds() {
+        assert!(matches!(tls_connector(), Ok(Connector::Rustls(_))));
+    }
 
     fn v6(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)

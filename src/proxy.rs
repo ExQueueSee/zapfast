@@ -392,10 +392,14 @@ pub fn agent() -> ureq::Agent {
     if let Some(agent) = &configured().read().unwrap_or_else(|e| e.into_inner()).agent {
         return agent.clone();
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .proxy(ureq_proxy())
-        .build()
-        .into();
+    let builder = ureq::Agent::config_builder().proxy(ureq_proxy());
+    #[cfg(windows)]
+    let builder = builder.tls_config(
+        ureq::tls::TlsConfig::builder()
+            .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+            .build(),
+    );
+    let agent: ureq::Agent = builder.build().into();
     configured()
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -412,7 +416,7 @@ pub fn reqwest_proxy() -> Option<reqwest::Proxy> {
 /// Opens the WhatsApp WebSocket through a proxy.
 pub struct ProxyTransportFactory {
     proxy: Proxy,
-    connector: OnceLock<Connector>,
+    connector: OnceLock<Result<Connector, String>>,
 }
 
 impl ProxyTransportFactory {
@@ -442,6 +446,15 @@ impl TransportFactory for ProxyTransportFactory {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_http_agent_uses_platform_verifier() {
+        assert!(matches!(
+            agent().config().tls_config().root_certs(),
+            ureq::tls::RootCerts::PlatformVerifier
+        ));
+    }
 
     #[test]
     fn parses_supported_schemes() {
