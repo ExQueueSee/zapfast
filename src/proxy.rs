@@ -397,10 +397,25 @@ pub fn agent() -> ureq::Agent {
     if let Some(agent) = &configured().read().unwrap_or_else(|e| e.into_inner()).agent {
         return agent.clone();
     }
+
+    let native_certs = rustls_native_certs::load_native_certs();
+
+    let native_roots: Vec<ureq::tls::Certificate<'static>> = native_certs
+        .certs
+        .iter()
+        .map(|cert| ureq::tls::Certificate::from_der(cert.as_ref()).to_owned())
+        .collect();
+
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .proxy(ureq_proxy())
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .root_certs(ureq::tls::RootCerts::new_with_certs(&native_roots))
+                .build(),
+        )
         .build()
         .into();
+
     configured()
         .write()
         .unwrap_or_else(|e| e.into_inner())

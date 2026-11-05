@@ -79,7 +79,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 # both merge, and to crates.io once released. `voip` is the call stack: signaling,
 # the sans-IO media engine with MLOW and libopus codecs, and the native UDP
 # relay transport.
-whatsapp-rust = { git = "https://github.com/crmne/whatsapp-rust", rev = "94f7c1376f8f6a77c55d85570a260600ad27de0b", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "voip"] }
+whatsapp-rust = { path = "../whatsapp-rust-src", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "voip"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "net", "io-util"] }
 # Queue between the call's audio streams and the engine.
 async-channel = "2.5"
@@ -97,11 +97,12 @@ getrandom = "0.4"
 zeroize = "1"
 rand = "0.10"
 # The updater's HTTP client, with the proxy setting.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "socks"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots", "socks"] }
 qrcode = { version = "0.14", default-features = false }
 # Downloads profile pictures. The protocol library already includes this crate
 # and TLS stack.
 ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
+rustls-native-certs = "0.8.4"
 jiff = "0.2"
 # Treats joined emoji as one grapheme. Already included through egui.
 unicode-segmentation = "1"
