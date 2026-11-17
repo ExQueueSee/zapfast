@@ -433,7 +433,10 @@ fn proxy_url_for_preview(url: &str) -> String {
     }
 }
 
-fn client(url: &reqwest::Url) -> Option<reqwest::Client> {
+fn client(
+    url: &reqwest::Url,
+    trust: Option<&crate::enterprise_ca::EnterpriseCaTrust>,
+) -> Option<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
@@ -456,27 +459,37 @@ fn client(url: &reqwest::Url) -> Option<reqwest::Client> {
     if !proxied {
         builder = builder.dns_resolver(Arc::new(GuardedResolver));
     }
+    if let Some(trust) = trust {
+        builder = crate::enterprise_ca::add_approved_certificates_to_async_builder(builder, trust)
+            .ok()?;
+    }
     builder.build().ok()
 }
 
 /// Read the page at `url` and, if it describes itself, its picture. Only the
 /// linked site is contacted. Gives `None` on any failure or when the page says
 /// nothing; nothing about the link is logged.
-pub(super) async fn fetch(url: String) -> Option<ComposedPreview> {
-    tokio::time::timeout(TOTAL_TIME, fetch_inner(url))
+pub(super) async fn fetch(
+    url: String,
+    trust: Option<crate::enterprise_ca::EnterpriseCaTrust>,
+) -> Option<ComposedPreview> {
+    tokio::time::timeout(TOTAL_TIME, fetch_inner(url, trust))
         .await
         .ok()
         .flatten()
 }
 
-async fn fetch_inner(url: String) -> Option<ComposedPreview> {
+async fn fetch_inner(
+    url: String,
+    trust: Option<crate::enterprise_ca::EnterpriseCaTrust>,
+) -> Option<ComposedPreview> {
     // The preview names the address that was asked for, not where it led.
     let requested = crate::safety::preview_url(&url)?;
     let parsed = reqwest::Url::parse(&requested).ok()?;
     if !literal_host_allowed(&parsed) {
         return None;
     }
-    let client = client(&parsed)?;
+    let client = client(&parsed, trust.as_ref())?;
 
     let response = client.get(parsed).send().await.ok()?;
     if !response.status().is_success() {
@@ -831,10 +844,12 @@ mod tests {
     #[tokio::test]
     async fn fetch_refuses_local_without_network() {
         for url in ["http://127.0.0.1:9/", "http://printer.local/"] {
-            let result =
-                tokio::time::timeout(std::time::Duration::from_millis(100), fetch(url.into()))
-                    .await
-                    .expect("refused before any connection");
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                fetch(url.into(), None),
+            )
+            .await
+            .expect("refused before any connection");
             assert!(result.is_none(), "{url}");
         }
     }

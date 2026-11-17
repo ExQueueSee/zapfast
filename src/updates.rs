@@ -35,11 +35,18 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
 };
 
 /// An updater on the proxy-aware reqwest client.
-pub fn updater() -> anyhow::Result<Updater> {
+pub fn updater(trust: Option<&crate::enterprise_ca::EnterpriseCaTrust>) -> anyhow::Result<Updater> {
     let mut builder = reqwest::blocking::Client::builder();
+
     if let Some(proxy) = crate::proxy::reqwest_proxy() {
         builder = builder.proxy(proxy);
     }
+
+    if let Some(trust) = trust {
+        builder =
+            crate::enterprise_ca::add_approved_certificates_to_blocking_builder(builder, trust)?;
+    }
+
     Ok(Updater::new(CONFIG, ReqwestTransport::new(builder)?))
 }
 
@@ -56,6 +63,6 @@ mod tests {
 
     #[test]
     fn the_updater_starts_on_github() {
-        assert!(updater().unwrap().source().is_github());
+        assert!(updater(None).unwrap().source().is_github());
     }
 }

@@ -81,7 +81,11 @@ mod tests {
     fn backend_waits_for_window_acknowledgement_before_touching_storage() {
         let directory = tempfile::tempdir().unwrap();
         let dirs = crate::paths::AppDirs::under(directory.path());
-        let mut backend = super::Backend::spawn(dirs.as_account(), super::Waker::default());
+        let mut backend = super::Backend::spawn(
+            dirs.as_account(),
+            dirs.enterprise_ca_file(),
+            super::Waker::default(),
+        );
         assert!(!dirs.session_db().exists());
         assert!(!dirs.archive_db().exists());
         // Closing before a first frame must cancel startup without connecting
@@ -142,6 +146,21 @@ pub struct SendTurn {
 
 #[derive(Debug)]
 pub enum Command {
+    ApproveEnterpriseCa {
+        root: crate::enterprise_ca::NativeRoot,
+        retry: crate::model::EnterpriseCaRetry,
+    },
+    WhatsAppCaFailure {
+        generation: u64,
+    },
+    WhatsAppCaProbed {
+        generation: u64,
+        attempt: u64,
+        candidate: Option<(
+            crate::enterprise_ca::NativeRoot,
+            crate::enterprise_ca::CertificateInfo,
+        )>,
+    },
     FetchBlocklist,
     SetBlocked {
         chat: ChatId,
@@ -1189,6 +1208,14 @@ pub enum Event {
         chats: Vec<Chat>,
         state: crate::blocking::Blocklist,
     },
+
+    EnterpriseCaApprovalRequired {
+        host: String,
+        root: crate::enterprise_ca::NativeRoot,
+        certificate: crate::enterprise_ca::CertificateInfo,
+        retry: crate::model::EnterpriseCaRetry,
+    },
+
     /// The phone's "Disable link previews", sent at start and on every change.
     LinkPreviewsDisabled(bool),
     /// What the page at `url` says about itself, or `None` when it said nothing.
@@ -1759,7 +1786,7 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn spawn(dirs: AccountDirs, waker: Waker) -> Self {
+    pub fn spawn(dirs: AccountDirs, enterprise_ca_file: PathBuf, waker: Waker) -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1775,7 +1802,15 @@ impl Backend {
             .spawn(move || {
                 runtime.block_on(async move {
                     if started.await.is_ok() {
-                        worker::run(dirs, event_tx, worker_commands, command_rx, waker).await;
+                        worker::run(
+                            dirs,
+                            enterprise_ca_file,
+                            event_tx,
+                            worker_commands,
+                            command_rx,
+                            waker,
+                        )
+                        .await;
                     }
                 });
                 runtime.shutdown_timeout(Duration::from_secs(3));

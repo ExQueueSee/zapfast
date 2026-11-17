@@ -289,7 +289,7 @@ impl Account {
             AccountSettings::default()
         };
         resolve_wallpaper_path(&dirs, &mut settings);
-        let backend = Backend::spawn(dirs.clone(), waker.clone());
+        let backend = Backend::spawn(dirs.clone(), app_dirs.enterprise_ca_file(), waker.clone());
         Ok(Self::new(id, dirs, settings, backend))
     }
 

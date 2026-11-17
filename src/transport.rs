@@ -200,6 +200,13 @@ impl HappyEyeballsTransportFactory {
             connector: OnceLock::new(),
         }
     }
+
+    pub fn with_connector(connector: Connector) -> Self {
+        Self {
+            url: WHATSAPP_WEB_WS_URL.to_owned(),
+            connector: OnceLock::from(connector),
+        }
+    }
 }
 
 impl Default for HappyEyeballsTransportFactory {

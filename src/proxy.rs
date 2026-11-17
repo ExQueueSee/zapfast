@@ -427,6 +427,13 @@ impl ProxyTransportFactory {
             connector: OnceLock::new(),
         }
     }
+
+    pub fn with_connector(proxy: Proxy, connector: Connector) -> Self {
+        Self {
+            proxy,
+            connector: OnceLock::from(connector),
+        }
+    }
 }
 
 #[whatsapp_rust::async_trait]

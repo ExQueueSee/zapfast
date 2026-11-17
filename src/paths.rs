@@ -90,6 +90,10 @@ impl AppDirs {
         self.config.join("settings.json")
     }
 
+    pub fn enterprise_ca_file(&self) -> PathBuf {
+        self.config.join("enterprise-ca.json")
+    }
+
     /// Ordered list of account ids and the active one.
     pub fn accounts_file(&self) -> PathBuf {
         self.config.join("accounts.json")

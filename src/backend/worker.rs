@@ -78,6 +78,36 @@ use crate::model::{
 use crate::paths::AccountDirs;
 use crate::privacy::{self, PrivacyChoice, PrivacyKind};
 
+struct CaObservedTransport {
+    inner: Box<dyn whatsapp_rust::transport::TransportFactory>,
+    captured: crate::enterprise_ca::CapturedChain,
+    commands: mpsc::UnboundedSender<Command>,
+    generation: u64,
+}
+
+#[whatsapp_rust::async_trait]
+impl whatsapp_rust::transport::TransportFactory for CaObservedTransport {
+    async fn create_transport(&self) -> Result<crate::transport::Link, anyhow::Error> {
+        *self
+            .captured
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        let result = self.inner.create_transport().await;
+        let unknown_issuer = self
+            .captured
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .is_some();
+        if result.is_err() && unknown_issuer {
+            let _ = self.commands.send(Command::WhatsAppCaFailure {
+                generation: self.generation,
+            });
+        }
+        result
+    }
+}
+
 /// Delay after the last history chunk before sync is complete.
 const SYNC_QUIET: Duration = Duration::from_secs(20);
 /// Profile-picture cache lifetime.
@@ -854,6 +884,7 @@ fn behind_a_search(queued: Vec<Command>) -> BehindASearch {
 /// Runs the protocol worker, receiving commands and waking the interface for emitted events.
 pub async fn run(
     dirs: AccountDirs,
+    enterprise_ca_file: PathBuf,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
     mut inbox: mpsc::UnboundedReceiver<Command>,
@@ -988,6 +1019,10 @@ pub async fn run(
         pin_generation: HashMap::new(),
         withheld_pages: Vec::new(),
         dirs,
+        enterprise_ca_file,
+        ca_generation: 0,
+        ca_attempt: 0,
+        ca_probe_started: false,
         events,
         commands,
         waker,
@@ -1498,6 +1533,10 @@ struct Worker {
     /// one has, an answer with an unknown id is still matched by its chat.
     older_ids_match: bool,
     dirs: AccountDirs,
+    enterprise_ca_file: PathBuf,
+    ca_generation: u64,
+    ca_attempt: u64,
+    ca_probe_started: bool,
     events: std::sync::mpsc::Sender<Event>,
     commands: mpsc::UnboundedSender<Command>,
     waker: Waker,
@@ -2399,6 +2438,8 @@ impl Worker {
         if self.status != status {
             log::info!("link: {}", status.log_label());
             if matches!(status, LinkStatus::Connected) {
+                self.ca_attempt = self.ca_attempt.wrapping_add(1);
+                self.ca_probe_started = false;
                 // The phone may have history for us again.
                 self.prefetch.on_connected();
             }
@@ -3106,6 +3147,8 @@ impl Worker {
     }
 
     async fn start_bot(&mut self) {
+        self.ca_generation = self.ca_generation.wrapping_add(1);
+        self.ca_probe_started = false;
         let path = self.dirs.session_db();
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -3119,6 +3162,67 @@ impl Worker {
                 return;
             }
         };
+
+        let enterprise_ca_trust =
+            match crate::enterprise_ca::EnterpriseCaTrust::load(&self.enterprise_ca_file) {
+                Ok(trust) => trust,
+                Err(error) => {
+                    self.set_status(LinkStatus::Failed(format!(
+                        "Could not load enterprise CA trust settings: {error}"
+                    )));
+                    return;
+                }
+            };
+
+        if !enterprise_ca_trust.approved_roots.is_empty() {
+            log::info!(
+                "loaded {} explicitly approved enterprise CA(s)",
+                enterprise_ca_trust.approved_roots.len()
+            );
+        }
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let roots = match enterprise_ca_trust.native_roots() {
+            Ok(roots) => roots
+                .into_iter()
+                .map(|root| rustls::pki_types::CertificateDer::from(root.der))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                self.set_status(LinkStatus::Failed(format!(
+                    "Could not load enterprise CA trust settings: {error}"
+                )));
+                return;
+            }
+        };
+        let connector =
+            match crate::enterprise_ca::capturing_tls_connector(Arc::clone(&captured), roots) {
+                Ok(connector) => connector,
+                Err(error) => {
+                    self.set_status(LinkStatus::Failed(format!(
+                        "Could not configure WhatsApp TLS: {error}"
+                    )));
+                    return;
+                }
+            };
+        let approved_http = if enterprise_ca_trust.approved_roots.is_empty() {
+            None
+        } else {
+            let http =
+                match crate::enterprise_ca::ApprovedReqwestHttpClient::new(&enterprise_ca_trust)
+                    .await
+                {
+                    Ok(http) => http,
+                    Err(error) => {
+                        self.set_status(LinkStatus::Failed(format!(
+                            "Could not configure approved enterprise CA for HTTP TLS: {error}"
+                        )));
+                        return;
+                    }
+                };
+
+            Some(http)
+        };
+
         let sender = self.wa_sender.clone();
         let builder = host_owned_presence(Bot::builder().with_backend(store))
             .with_watched_ab_props([
@@ -3126,20 +3230,32 @@ impl Worker {
                 abprops::web::ENABLE_WEB_CALLING,
                 abprops::web::ENABLE_WEB_GROUP_CALLING,
             ]);
-        let builder = match crate::proxy::for_whatsapp() {
+        let proxy = crate::proxy::for_whatsapp();
+        let transport: Box<dyn whatsapp_rust::transport::TransportFactory> = match proxy.clone() {
             Some(proxy) => {
                 log::info!("connecting through the proxy {}", proxy.redacted());
-                builder
-                    .with_transport_factory(crate::proxy::ProxyTransportFactory::new(proxy))
-                    .with_http_client(whatsapp_rust::http::UreqHttpClient::with_agent(
-                        crate::proxy::agent(),
-                    ))
+                Box::new(crate::proxy::ProxyTransportFactory::with_connector(
+                    proxy, connector,
+                ))
             }
-            // Every address the host resolves to is dialed, not only the first
-            // one, so a network whose IPv6 does not answer still links over
-            // IPv4 (#212).
-            None => builder
-                .with_transport_factory(crate::transport::HappyEyeballsTransportFactory::new()),
+            None => {
+                Box::new(crate::transport::HappyEyeballsTransportFactory::with_connector(connector))
+            }
+        };
+        let builder = builder.with_transport_factory(CaObservedTransport {
+            inner: transport,
+            captured,
+            commands: self.commands.clone(),
+            generation: self.ca_generation,
+        });
+        let builder = if let Some(http) = approved_http {
+            builder.with_http_client(http)
+        } else if proxy.is_some() {
+            builder.with_http_client(whatsapp_rust::http::UreqHttpClient::with_agent(
+                crate::proxy::agent(),
+            ))
+        } else {
+            builder
         };
         let bot = builder
             // WhatsApp reads the linked-device name, version, and icon at pairing.
@@ -3432,6 +3548,8 @@ impl Worker {
     }
 
     async fn stop_bot(&mut self) {
+        self.ca_generation = self.ca_generation.wrapping_add(1);
+        self.ca_probe_started = false;
         self.blocklist.invalidate();
         self.client = None;
         // A batch still going belongs to the session that was sending it, and
@@ -7615,11 +7733,195 @@ impl Worker {
             Command::FavoritesRecovered { complete } => self.favorites_recovered(complete),
             Command::FirstNamesRecovered { complete } => self.first_names_recovered(complete),
             Command::StarsRecovered { complete } => self.stars_recovered(complete),
+            Command::WhatsAppCaFailure { generation } => {
+                if generation != self.ca_generation
+                    || self.ca_probe_started
+                    || self.status.is_connected()
+                {
+                    return;
+                }
+                self.ca_probe_started = true;
+                self.ca_attempt = self.ca_attempt.wrapping_add(1);
+                let attempt = self.ca_attempt;
+                self.set_status(LinkStatus::Failed("Could not verify WhatsApp's connection certificate. Check your network or try again.".to_owned()));
+                let commands = self.commands.clone();
+                let path = self.enterprise_ca_file.clone();
+                tokio::spawn(async move {
+                    let candidate = async {
+                        let uri: http::Uri =
+                            whatsapp_rust::wacore::net::WHATSAPP_WEB_WS_URL.parse()?;
+                        let host = uri
+                            .host()
+                            .ok_or_else(|| anyhow::anyhow!("WhatsApp URL has no host"))?;
+                        let trust = crate::enterprise_ca::EnterpriseCaTrust::load(&path)?;
+                        let roots = trust
+                            .native_roots()?
+                            .into_iter()
+                            .map(|root| rustls::pki_types::CertificateDer::from(root.der))
+                            .collect::<Vec<_>>();
+                        let Some(chain) = crate::enterprise_ca::probe_server_chain_with_roots(
+                            host,
+                            uri.port_u16().unwrap_or(443),
+                            roots,
+                            true,
+                        )
+                        .await?
+                        else {
+                            return Ok(None);
+                        };
+                        let host = host.to_owned();
+                        let candidate = tokio::task::spawn_blocking(move || {
+                            crate::enterprise_ca::find_validated_root_candidate(&host, &chain)
+                        })
+                        .await??;
+                        let Some(root) = candidate else {
+                            return Ok(None);
+                        };
+                        if crate::enterprise_ca::EnterpriseCaTrust::load(&path)?.is_approved(&root)
+                        {
+                            return Ok(None);
+                        }
+                        let info = crate::enterprise_ca::certificate_info(&root.der)?;
+                        Ok::<_, anyhow::Error>(Some((root, info)))
+                    }
+                    .await;
+                    let candidate = match candidate {
+                        Ok(candidate) => candidate,
+                        Err(error) => {
+                            log::debug!("Could not inspect WhatsApp TLS certificate: {error:#}");
+                            None
+                        }
+                    };
+                    let _ = commands.send(Command::WhatsAppCaProbed {
+                        generation,
+                        attempt,
+                        candidate,
+                    });
+                });
+            }
+            Command::WhatsAppCaProbed {
+                generation,
+                attempt,
+                candidate,
+            } => {
+                if generation == self.ca_generation
+                    && attempt == self.ca_attempt
+                    && self.ca_probe_started
+                    && !self.status.is_connected()
+                    && let Some((root, certificate)) = candidate
+                {
+                    let uri: http::Uri = whatsapp_rust::wacore::net::WHATSAPP_WEB_WS_URL
+                        .parse()
+                        .expect("WhatsApp URL");
+                    self.emit(Event::EnterpriseCaApprovalRequired {
+                        host: uri.host().unwrap_or("web.whatsapp.com").to_owned(),
+                        root,
+                        certificate,
+                        retry: crate::model::EnterpriseCaRetry::WhatsApp {
+                            generation,
+                            attempt,
+                        },
+                    });
+                }
+            }
+            Command::ApproveEnterpriseCa { root, retry } => {
+                if let crate::model::EnterpriseCaRetry::WhatsApp {
+                    generation,
+                    attempt,
+                } = &retry
+                    && (*generation != self.ca_generation
+                        || *attempt != self.ca_attempt
+                        || !self.ca_probe_started
+                        || self.status.is_connected())
+                {
+                    return;
+                }
+                let result =
+                    crate::enterprise_ca::approve_and_save(&self.enterprise_ca_file, &root);
+
+                match result {
+                    Ok(_) => match retry {
+                        crate::model::EnterpriseCaRetry::SignalSticker(url) => {
+                            let _ = self.commands.send(Command::ImportStickerUrl { url });
+                        }
+                        crate::model::EnterpriseCaRetry::WhatsApp { .. } => {
+                            self.stop_bot().await;
+                            self.start_bot().await;
+                        }
+                    },
+                    Err(error) => match retry {
+                        crate::model::EnterpriseCaRetry::SignalSticker(_) => {
+                            let _ = self.commands.send(Command::StickerPackImported {
+                                result: Err(format!(
+                                    "Could not save approved enterprise CA: {error}"
+                                )),
+                            });
+                        }
+                        crate::model::EnterpriseCaRetry::WhatsApp { .. } => {
+                            self.set_status(LinkStatus::Failed(format!(
+                                "Could not save approved enterprise CA: {error}"
+                            )))
+                        }
+                    },
+                }
+            }
             Command::ImportStickerUrl { url } => {
                 let commands = self.commands.clone();
+                let events = self.events.clone();
+                let waker = self.waker.clone();
                 let packs = self.packs_dir();
-                tokio::task::spawn_blocking(move || {
-                    let result = super::sticker_import::import_signal_pack(&url, &packs);
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+                let enterprise_ca_file_for_probe = enterprise_ca_file.clone();
+
+                tokio::spawn(async move {
+                    let import_url = url.clone();
+
+                    let result = tokio::task::spawn_blocking(move || {
+                        let trust =
+                            crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+                                .map_err(|error| {
+                                    super::sticker_import::SignalImportError::Other(
+                                        error.to_string(),
+                                    )
+                                })?;
+
+                        super::sticker_import::import_signal_pack(&import_url, &packs, Some(&trust))
+                    })
+                    .await
+                    .unwrap_or_else(|error| {
+                        Err(super::sticker_import::SignalImportError::Other(format!(
+                            "Sticker import task failed: {error}"
+                        )))
+                    });
+
+                    if matches!(
+                        &result,
+                        Err(super::sticker_import::SignalImportError::Request(_))
+                    ) && let Ok(trust) =
+                        crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file_for_probe)
+                        && let Ok(Some((root, certificate))) =
+                            super::sticker_import::signal_enterprise_ca_candidate(&trust).await
+                    {
+                        let should_prompt = crate::enterprise_ca::EnterpriseCaTrust::load(
+                            &enterprise_ca_file_for_probe,
+                        )
+                        .map(|trust| !trust.is_approved(&root))
+                        .unwrap_or(false);
+
+                        if should_prompt {
+                            let _ = events.send(Event::EnterpriseCaApprovalRequired {
+                                host: "cdn.signal.org".to_owned(),
+                                root,
+                                certificate,
+                                retry: crate::model::EnterpriseCaRetry::SignalSticker(url),
+                            });
+                            waker.wake();
+                            return;
+                        }
+                    }
+
+                    let result = result.map_err(|error| error.to_string());
+
                     let _ = commands.send(Command::StickerPackImported { result });
                 });
             }
@@ -8260,8 +8562,9 @@ impl Worker {
             } => {
                 let commands = self.commands.clone();
                 let dir = self.dirs.cache.join("gifs");
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
                 tokio::task::spawn_blocking(move || {
-                    let results = search_gifs(&query, &key, &dir, offset);
+                    let results = search_gifs(&query, &key, &dir, offset, &enterprise_ca_file);
                     let _ = commands.send(Command::GifResults {
                         query,
                         offset,
@@ -8273,14 +8576,21 @@ impl Worker {
             Command::FetchGifAnimation { id, url, extension } => {
                 let commands = self.commands.clone();
                 let dir = self.dirs.cache.join("gifs");
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+
                 tokio::task::spawn_blocking(move || {
                     let _ = std::fs::create_dir_all(&dir);
+
+                    let approved_http = giphy_http_client(&enterprise_ca_file).ok().flatten();
+
                     let path = gif_path(&dir, &id, &extension);
+
                     let path = if path.exists() {
                         Some(path)
                     } else {
-                        fetch_gif(&url, &path)
+                        fetch_gif(&url, &path, approved_http.as_ref())
                     };
+
                     let _ = commands.send(Command::GifAnimated { id, path });
                 });
             }
@@ -8371,8 +8681,13 @@ impl Worker {
             Command::InspectUpdate => {
                 let events = self.events.clone();
                 let waker = self.waker.clone();
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+
                 tokio::task::spawn_blocking(move || {
-                    let result = crate::updates::updater()
+                    let trust = crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file);
+
+                    let result = trust
+                        .and_then(|trust| crate::updates::updater(Some(&trust)))
                         .map_err(|error| format!("{error:#}"))
                         .and_then(|updater| {
                             updater.installation().map_err(|reason| reason.to_string())
@@ -8384,8 +8699,11 @@ impl Worker {
             Command::DownloadUpdate { release, source } => {
                 let events = self.events.clone();
                 let waker = self.waker.clone();
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+
                 tokio::task::spawn_blocking(move || {
-                    let result = crate::updates::updater()
+                    let result = crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+                        .and_then(|trust| crate::updates::updater(Some(&trust)))
                         .and_then(|updater| {
                             updater
                                 .with_source(source)
@@ -8406,8 +8724,11 @@ impl Worker {
             } => {
                 let events = self.events.clone();
                 let waker = self.waker.clone();
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+
                 tokio::task::spawn_blocking(move || {
-                    let result = crate::updates::updater()
+                    let result = crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+                        .and_then(|trust| crate::updates::updater(Some(&trust)))
                         .and_then(|updater| updater.handoff(*prepared, arguments))
                         .map_err(|error| format!("{error:#}"));
                     let _ = events.send(Event::UpdateInstalling(result));
@@ -8417,8 +8738,14 @@ impl Worker {
             Command::CheckForUpdates => {
                 let events = self.events.clone();
                 let waker = self.waker.clone();
+                let enterprise_ca_file = self.enterprise_ca_file.clone();
+
                 tokio::task::spawn_blocking(move || {
-                    match crate::updates::updater().and_then(|updater| updater.check()) {
+                    let result = crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+                        .and_then(|trust| crate::updates::updater(Some(&trust)))
+                        .and_then(|updater| updater.check());
+
+                    match result {
                         Ok(Some(release)) => {
                             let _ = events.send(Event::UpdateAvailable {
                                 version: release.version,
@@ -8865,6 +9192,11 @@ impl Worker {
                 self.emit(Event::AccountRemoved);
             }
             Command::Reconnect => {
+                if self.ca_probe_started {
+                    self.ca_attempt = self.ca_attempt.wrapping_add(1);
+                    self.ca_probe_started = false;
+                    self.set_status(LinkStatus::Connecting);
+                }
                 if let Some(client) = self.client.clone() {
                     tokio::spawn(async move { client.reconnect_immediately().await });
                 } else {
@@ -9615,8 +9947,21 @@ impl Worker {
         }
         let events = self.events.clone();
         let waker = self.waker.clone();
+        let enterprise_ca_file = self.enterprise_ca_file.clone();
+
         self.preview_fetch = Some(tokio::spawn(async move {
-            let preview = link_preview::fetch(url.clone()).await;
+            let trust = tokio::task::spawn_blocking(move || {
+                crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+            })
+            .await
+            .ok()
+            .and_then(Result::ok);
+
+            let preview = match trust {
+                Some(trust) => link_preview::fetch(url.clone(), Some(trust)).await,
+                None => None,
+            };
+
             let _ = events.send(Event::LinkPreview { url, preview });
             waker.wake();
         }));
@@ -10766,6 +11111,7 @@ impl Worker {
             return;
         };
         let commands = self.commands.clone();
+        let enterprise_ca_file = self.enterprise_ca_file.clone();
         tokio::spawn(async move {
             let fetched = async {
                 let mut picture = None;
@@ -10808,7 +11154,9 @@ impl Worker {
                         Ok(None)
                     };
                 };
-                download_avatar(picture.url, path).await.map(Some)
+                download_avatar(picture.url, path, enterprise_ca_file)
+                    .await
+                    .map(Some)
             }
             .await;
             match fetched {
@@ -13195,27 +13543,53 @@ fn last_avatar(path: &Path) -> Option<PathBuf> {
         .then(|| path.to_path_buf())
 }
 
-async fn download_avatar(url: String, path: PathBuf) -> Result<PathBuf, String> {
+async fn download_avatar(
+    url: String,
+    path: PathBuf,
+    enterprise_ca_file: PathBuf,
+) -> Result<PathBuf, String> {
     let bytes = tokio::task::spawn_blocking(move || {
-        crate::proxy::agent()
+        let trust = crate::enterprise_ca::EnterpriseCaTrust::load(&enterprise_ca_file)
+            .map_err(|error| error.to_string())?;
+
+        if trust.approved_roots.is_empty() {
+            return crate::proxy::agent()
+                .get(&url)
+                .call()
+                .and_then(|mut response| response.body_mut().read_to_vec())
+                .map_err(|error| error.to_string());
+        }
+
+        let client = crate::enterprise_ca::approved_reqwest_client(&trust)
+            .map_err(|error| error.to_string())?;
+
+        let mut response = client
             .get(&url)
-            .call()
-            .and_then(|mut response| response.body_mut().read_to_vec())
-            .map_err(|error| error.to_string())
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|error| error.to_string())?;
+
+        let mut bytes = Vec::new();
+
+        std::io::Read::read_to_end(&mut response, &mut bytes).map_err(|error| error.to_string())?;
+
+        Ok(bytes)
     })
     .await
     .map_err(|error| error.to_string())??;
+
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| error.to_string())?;
     }
+
     tokio::fs::write(&path, &bytes)
         .await
         .map_err(|error| error.to_string())?;
+
     Ok(path)
 }
-
 /// Crops a picture file to a centred square and encodes it at the size
 /// WhatsApp uses for profile and group pictures.
 fn profile_picture_jpeg(path: &std::path::Path) -> Result<Vec<u8>, String> {
@@ -13705,9 +14079,29 @@ fn percent_encode(text: &str) -> String {
 /// A search result with its still and animated renditions.
 type GifResult = (Gif, Option<String>, Option<(String, &'static str)>);
 
+fn giphy_http_client(
+    enterprise_ca_file: &Path,
+) -> Result<Option<reqwest::blocking::Client>, String> {
+    let trust = crate::enterprise_ca::EnterpriseCaTrust::load(enterprise_ca_file)
+        .map_err(|error| error.to_string())?;
+
+    if trust.approved_roots.is_empty() {
+        return Ok(None);
+    }
+
+    crate::enterprise_ca::approved_reqwest_client(&trust)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
 /// Searches GIPHY and downloads result stills. Animated previews are fetched
 /// when their tiles first show. Empty queries list trending GIFs.
-fn search_gifs(query: &str, key: &str, dir: &Path, offset: usize) -> Result<GifPage, GifError> {
+fn search_gifs(
+    query: &str,
+    key: &str,
+    dir: &Path,
+    offset: usize,
+    enterprise_ca_file: &Path,
+) -> Result<GifPage, GifError> {
     let plain = |message: String| GifError {
         message,
         bad_key: false,
@@ -13728,26 +14122,54 @@ fn search_gifs(query: &str, key: &str, dir: &Path, offset: usize) -> Result<GifP
             percent_encode(query.trim())
         )
     };
-    let body = match crate::proxy::agent()
-        .get(&url)
-        .config()
-        .timeout_global(Some(GIF_TIMEOUT))
-        .build()
-        .call()
-    {
-        Ok(mut response) => response
-            .body_mut()
-            .read_to_string()
-            .map_err(|error| plain(format!("GIPHY request failed: {error}")))?,
-        // Treat 401 and 403 as API-key failures for the picker.
-        Err(ureq::Error::StatusCode(code @ (401 | 403))) => {
+
+    let approved_http = giphy_http_client(enterprise_ca_file)
+        .map_err(|error| plain(format!("GIPHY request failed: {error}")))?;
+
+    let body = if let Some(client) = approved_http.as_ref() {
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|error| plain(format!("GIPHY request failed: {error}")))?;
+
+        let code = response.status().as_u16();
+
+        if code == 401 || code == 403 {
             return Err(GifError {
                 message: format!("GIPHY rejected the API key (error {code})."),
                 bad_key: true,
             });
         }
-        Err(error) => return Err(plain(format!("GIPHY request failed: {error}"))),
+
+        if !response.status().is_success() {
+            return Err(plain(format!("GIPHY request failed: HTTP {code}")));
+        }
+
+        response
+            .text()
+            .map_err(|error| plain(format!("GIPHY request failed: {error}")))?
+    } else {
+        match crate::proxy::agent()
+            .get(&url)
+            .config()
+            .timeout_global(Some(GIF_TIMEOUT))
+            .build()
+            .call()
+        {
+            Ok(mut response) => response
+                .body_mut()
+                .read_to_string()
+                .map_err(|error| plain(format!("GIPHY request failed: {error}")))?,
+            Err(ureq::Error::StatusCode(code @ (401 | 403))) => {
+                return Err(GifError {
+                    message: format!("GIPHY rejected the API key (error {code})."),
+                    bad_key: true,
+                });
+            }
+            Err(error) => return Err(plain(format!("GIPHY request failed: {error}"))),
+        }
     };
+
     let json: serde_json::Value = serde_json::from_str(&body)
         .map_err(|error| plain(format!("Invalid GIPHY response: {error}")))?;
     if let Some(message) = json["meta"]["msg"].as_str()
@@ -13830,11 +14252,13 @@ fn search_gifs(query: &str, key: &str, dir: &Path, offset: usize) -> Result<GifP
             }
             let still = still.take();
             let still_slot = &mut gif.still;
+            let approved_http = approved_http.clone();
+
             scope.spawn(move || {
                 if let Some(url) = still
                     && let Some(path) = still_path
                 {
-                    *still_slot = fetch_gif(&url, &path);
+                    *still_slot = fetch_gif(&url, &path, approved_http.as_ref());
                 }
             });
         }
@@ -13868,15 +14292,31 @@ fn gif_rendition(images: &serde_json::Value) -> Option<(String, &'static str)> {
 }
 
 /// Downloads one GIF thumbnail, returning its path once written.
-fn fetch_gif(url: &str, path: &Path) -> Option<PathBuf> {
-    let bytes = crate::proxy::agent()
-        .get(url)
-        .config()
-        .timeout_global(Some(GIF_TIMEOUT))
-        .build()
-        .call()
-        .and_then(|mut response| response.body_mut().read_to_vec())
-        .ok()?;
+fn fetch_gif(
+    url: &str,
+    path: &Path,
+    approved_http: Option<&reqwest::blocking::Client>,
+) -> Option<PathBuf> {
+    let bytes = match approved_http {
+        Some(client) => {
+            let mut response = client.get(url).send().ok()?.error_for_status().ok()?;
+
+            let mut bytes = Vec::new();
+
+            std::io::Read::read_to_end(&mut response, &mut bytes).ok()?;
+
+            bytes
+        }
+        None => crate::proxy::agent()
+            .get(url)
+            .config()
+            .timeout_global(Some(GIF_TIMEOUT))
+            .build()
+            .call()
+            .and_then(|mut response| response.body_mut().read_to_vec())
+            .ok()?,
+    };
+
     store_gif(path, &bytes)
 }
 
@@ -20029,6 +20469,7 @@ mod receipt_tests {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let root =
             std::env::temp_dir().join(format!("zapfast-worker-test-{}-{n}", std::process::id()));
+        let app_dirs = crate::paths::AppDirs::under(&root);
         let worker = Worker {
             privacy_ready: true,
             privacy_confirmed: true,
@@ -20051,6 +20492,10 @@ mod receipt_tests {
             pin_generation: HashMap::new(),
             withheld_pages: Vec::new(),
             dirs: crate::paths::AppDirs::under(&root).as_account(),
+            enterprise_ca_file: app_dirs.enterprise_ca_file(),
+            ca_generation: 0,
+            ca_attempt: 0,
+            ca_probe_started: false,
             events,
             commands,
             waker: Waker::default(),

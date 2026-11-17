@@ -2472,10 +2472,22 @@ pub struct InfoPanel {
     pub view: InfoView,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnterpriseCaRetry {
+    WhatsApp { generation: u64, attempt: u64 },
+    SignalSticker(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dialog {
     Shortcuts,
     About,
+    ConfirmEnterpriseCa {
+        host: String,
+        root: crate::enterprise_ca::NativeRoot,
+        certificate: Box<crate::enterprise_ca::CertificateInfo>,
+        retry: EnterpriseCaRetry,
+    },
     ConfirmUnlink,
     ConfirmRemoveAccount(AccountId),
     /// Confirms emptying one account's media cache.
@@ -2708,6 +2720,11 @@ pub fn forward_limit(frequently_forwarded: bool) -> usize {
 /// Actions queued by views and applied after drawing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
+    ApproveEnterpriseCa {
+        root: crate::enterprise_ca::NativeRoot,
+        retry: EnterpriseCaRetry,
+    },
+    CancelEnterpriseCa,
     FetchBlocklist,
     SetBlocked {
         chat: ChatId,

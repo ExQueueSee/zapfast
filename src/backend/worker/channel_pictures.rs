@@ -91,6 +91,7 @@ impl Worker {
         };
         let path = self.avatar_file(&id, full);
         let commands = self.commands.clone();
+        let enterprise_ca_file = self.enterprise_ca_file.clone();
         tokio::spawn(async move {
             let fetched = async {
                 let picture = match known {
@@ -103,9 +104,11 @@ impl Worker {
                         .map_err(|error| error.to_string())?,
                 };
                 match picture.path(full) {
-                    Some(direct_path) => download_avatar(picture_url(direct_path), path)
-                        .await
-                        .map(Some),
+                    Some(direct_path) => {
+                        download_avatar(picture_url(direct_path), path, enterprise_ca_file)
+                            .await
+                            .map(Some)
+                    }
                     None => Ok(None),
                 }
             }

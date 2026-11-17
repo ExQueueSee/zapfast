@@ -201,45 +201,144 @@ Lrsybb0z5gg8w7ZblEuB9zOW9M3l60DXuJO6l7g+deV6P96rv2unHS8UlvWiVWDy\n\
 9qfgAJizyy3kqM4lOwBH\n\
 -----END CERTIFICATE-----";
 
-/// HTTP client that trusts only Signal's sticker CDN authority.
-fn signal_agent() -> Result<ureq::Agent, String> {
-    use ureq::tls::{Certificate, RootCerts, TlsConfig};
-    let ca = Certificate::from_pem(SIGNAL_CA.as_bytes())
-        .map_err(|error| format!("Could not read the Signal certificate: {error}"))?;
-    let tls = TlsConfig::builder()
-        .root_certs(RootCerts::new_with_certs(&[ca]))
-        .build();
-    Ok(ureq::Agent::config_builder()
-        .tls_config(tls)
-        .proxy(crate::proxy::ureq_proxy())
-        .build()
-        .into())
+#[derive(Debug)]
+pub(super) enum SignalImportError {
+    Request(String),
+    Other(String),
 }
 
-fn fetch(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
-    agent
+impl std::fmt::Display for SignalImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Request(message) | Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SignalImportError {}
+
+impl From<String> for SignalImportError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+pub(super) fn signal_probe_roots() -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String>
+{
+    use rustls::pki_types::pem::PemObject;
+
+    let certificate = rustls::pki_types::CertificateDer::from_pem_slice(SIGNAL_CA.as_bytes())
+        .map_err(|error| format!("Could not read the Signal certificate: {error}"))?;
+
+    Ok(vec![certificate])
+}
+
+pub(super) async fn signal_enterprise_ca_candidate(
+    trust: &crate::enterprise_ca::EnterpriseCaTrust,
+) -> Result<
+    Option<(
+        crate::enterprise_ca::NativeRoot,
+        crate::enterprise_ca::CertificateInfo,
+    )>,
+    String,
+> {
+    const HOST: &str = "cdn.signal.org";
+
+    let mut probe_roots = signal_probe_roots()?;
+    probe_roots.extend(
+        trust
+            .native_roots()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|root| rustls::pki_types::CertificateDer::from(root.der)),
+    );
+
+    let Some(chain) = crate::enterprise_ca::probe_server_chain_with_roots(HOST, 443, probe_roots, false)
+        .await
+        .map_err(|error| format!("Could not probe {HOST}: {error}"))?
+    else {
+        return Ok(None);
+    };
+
+    let Some(root) = crate::enterprise_ca::find_validated_root_candidate(HOST, &chain)
+        .map_err(|error| format!("Could not validate enterprise CA candidate: {error}"))?
+    else {
+        return Ok(None);
+    };
+
+    let certificate = crate::enterprise_ca::certificate_info(&root.der)
+        .map_err(|error| format!("Could not inspect enterprise CA candidate: {error}"))?;
+
+    Ok(Some((root, certificate)))
+}
+
+/// HTTP client that trusts Signal's sticker CDN authority and user-approved certificate authorities.
+fn signal_client(
+    trust: Option<&crate::enterprise_ca::EnterpriseCaTrust>,
+) -> Result<reqwest::blocking::Client, String> {
+    let signal_ca = reqwest::Certificate::from_pem(SIGNAL_CA.as_bytes())
+        .map_err(|error| format!("Could not read the Signal certificate: {error}"))?;
+
+    let mut builder = reqwest::blocking::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(signal_ca)
+        .connect_timeout(std::time::Duration::from_secs(10));
+
+    if let Some(proxy) = crate::proxy::reqwest_proxy() {
+        builder = builder.proxy(proxy);
+    }
+
+    if let Some(trust) = trust {
+        builder =
+            crate::enterprise_ca::add_approved_certificates_to_blocking_builder(builder, trust)
+                .map_err(|error| error.to_string())?;
+    }
+
+    builder
+        .build()
+        .map_err(|error| format!("Could not build the Signal HTTP client: {error}"))
+}
+
+fn fetch_reqwest(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<Vec<u8>, SignalImportError> {
+    let mut response = client
         .get(url)
-        .call()
-        .map_err(|error| format!("signal.art request failed: {error}"))?
-        .body_mut()
-        .read_to_vec()
-        .map_err(|error| format!("Could not read the signal.art response: {error}"))
+        .send()
+        .map_err(|error| SignalImportError::Request(format!("signal.art request failed: {error}")))?
+        .error_for_status()
+        .map_err(|error| SignalImportError::Other(format!("signal.art request failed: {error}")))?;
+
+    let mut bytes = Vec::new();
+
+    response.read_to_end(&mut bytes).map_err(|error| {
+        SignalImportError::Other(format!("Could not read the signal.art response: {error}"))
+    })?;
+
+    Ok(bytes)
 }
 
 /// Downloads a signal.art pack into a directory named after its title.
-pub fn import_signal_pack(url: &str, packs: &Path) -> Result<String, String> {
+pub(super) fn import_signal_pack(
+    url: &str,
+    packs: &Path,
+    trust: Option<&crate::enterprise_ca::EnterpriseCaTrust>,
+) -> Result<String, SignalImportError> {
     let (id, key) = parse_signal_url(url)?;
-    let agent = signal_agent()?;
+    let client = signal_client(trust)?;
     let manifest = decrypt_blob(
-        &fetch(
-            &agent,
+        &fetch_reqwest(
+            &client,
             &format!("https://cdn.signal.org/stickers/{id}/manifest.proto"),
         )?,
         &key,
     )?;
     let (title, stickers) = parse_manifest(&manifest)?;
     if stickers.is_empty() {
-        return Err("This pack contains no stickers".to_owned());
+        return Err(SignalImportError::Other(
+            "This pack contains no stickers".to_owned(),
+        ));
     }
     let ids: Vec<u64> = stickers.iter().map(|sticker| sticker.id).collect();
     // Download several of the pack's files concurrently.
@@ -249,11 +348,11 @@ pub fn import_signal_pack(url: &str, packs: &Path) -> Result<String, String> {
         for (chunk, out) in ids.chunks(lane).zip(blobs.chunks_mut(lane)) {
             let id = &id;
             let key = &key;
-            let agent = &agent;
+            let client = &client;
             scope.spawn(move || {
                 for (sticker, slot) in chunk.iter().zip(out) {
-                    if let Ok(payload) = fetch(
-                        agent,
+                    if let Ok(payload) = fetch_reqwest(
+                        client,
                         &format!("https://cdn.signal.org/stickers/{id}/full/{sticker}"),
                     ) && let Ok(bytes) = decrypt_blob(&payload, key)
                     {
@@ -278,7 +377,7 @@ pub fn import_signal_pack(url: &str, packs: &Path) -> Result<String, String> {
             Some(crate::sticker_meta::write(&webp, &info).unwrap_or(webp))
         })
         .collect();
-    write_pack(packs, &title, files)
+    Ok(write_pack(packs, &title, files)?)
 }
 
 /// Imports a .wastickers or zip archive. Uses `title.txt` or the filename as title.
@@ -809,7 +908,7 @@ mod tests {
             "https://signal.art/addstickers/#pack_id=9acc9e8aba563d26a4994e69263e3b25&pack_key=5a6dff3948c28efb9b7aaf93ecc375c69fc316e78077ed26867a14d10a0f6a12"
                 .to_owned()
         });
-        let title = import_signal_pack(&url, &root).expect("imports");
+        let title = import_signal_pack(&url, &root, None).expect("imports");
         let mut files = 0;
         let mut moving = 0;
         for entry in std::fs::read_dir(root.join(&title))

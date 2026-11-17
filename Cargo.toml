@@ -99,6 +99,11 @@ qrcode = { version = "0.14", default-features = false }
 # Downloads profile pictures. The protocol library already includes this crate
 # and TLS stack.
 ureq = { version = "3", default-features = false, features = ["rustls", "socks-proxy"] }
+rustls-native-certs = "0.8.4"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+webpki-roots = "1.0.10"
+x509-parser = { version = "0.18.1", features = ["verify"] }
 jiff = "0.2"
 # Treats joined emoji as one grapheme. Already included through egui.
 unicode-segmentation = "1"
@@ -318,6 +323,8 @@ winresource = "0.1"
 env_logger = { version = "0.11", default-features = false }
 # Creates small APNGs in sticker-import tests. Already included through image.
 png = "0.18"
+# Generates disposable certificates for the TLS tests.
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # Finds and triggers application menu items in the menu test.

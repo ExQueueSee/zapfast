@@ -36,6 +36,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmUnlink => 380.0,
                 Dialog::ConfirmRemoveAccount(_) => 380.0,
                 Dialog::ConfirmClearMediaCache(_) => 380.0,
+                Dialog::ConfirmEnterpriseCa { .. } => 520.0,
                 Dialog::ConfirmLeaveGroup(_) => 380.0,
                 Dialog::PairWithPhone => 380.0,
                 Dialog::NewContact => 380.0,
@@ -79,6 +80,14 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             match dialog {
                 Dialog::CreatePoll(chat) => super::polls::create(app, ui, &chat),
                 Dialog::SendLocation(chat) => super::locations::send(app, ui, &chat),
+                Dialog::ConfirmEnterpriseCa {
+                    host,
+                    root,
+                    certificate,
+                    retry,
+                } => {
+                    confirm_enterprise_ca(app, ui, &host, &root, &certificate, &retry);
+                }
                 Dialog::PollResults { chat, message } => {
                     super::polls::results(app, ui, &chat, &message)
                 }
@@ -155,7 +164,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         });
     }
     if response.should_close() {
-        app.actions.push(Action::CloseDialog);
+        app.actions.push(
+            if matches!(app.dialog, Some(Dialog::ConfirmEnterpriseCa { .. })) {
+                Action::CancelEnterpriseCa
+            } else {
+                Action::CloseDialog
+            },
+        );
     }
 }
 
@@ -1643,6 +1658,57 @@ pub(super) fn confirm_destructive(
             }
             if theme::pill_button(ui, &palette, &cancel, false).clicked() {
                 app.actions.push(Action::CloseDialog);
+            }
+        });
+    });
+}
+
+fn confirm_enterprise_ca(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    host: &str,
+    root: &crate::enterprise_ca::NativeRoot,
+    certificate: &crate::enterprise_ca::CertificateInfo,
+    retry: &crate::model::EnterpriseCaRetry,
+) {
+    let palette = app.palette;
+
+    title(ui, app, "Trust this certificate authority?");
+
+    let body = format!(
+        "Zapfast could not verify the TLS connection to {host} using its normal trusted certificates.\n\n\
+         The network presented a certificate authority that can validate this connection, but is not trusted by Zapfast.\n\n\
+         This may be from your organization, network security software, a proxy, antivirus software, or a man-in-the-middle attacker. \n\n\
+         Host: {host}\n\
+         Subject: {}\n\
+         Issuer: {}\n\
+         Valid from: {}\n\
+         Valid until: {}\n\
+         SHA-256: {}\n\n\
+         Only approve this certificate authority if you recognize and trust it. \
+         Approving it allows this certificate authority to authenticate intercepted HTTPS traffic for Zapfast.",
+        certificate.subject,
+        certificate.issuer,
+        certificate.not_before,
+        certificate.not_after,
+        certificate.fingerprint(),
+    );
+
+    theme::paragraph(ui, body, theme::regular(13.5), palette.text);
+
+    ui.add_space(12.0);
+
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if theme::pill_button(ui, &palette, "Approve", true).clicked() {
+                app.actions.push(Action::ApproveEnterpriseCa {
+                    root: root.clone(),
+                    retry: retry.clone(),
+                });
+            }
+
+            if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+                app.actions.push(Action::CancelEnterpriseCa);
             }
         });
     });

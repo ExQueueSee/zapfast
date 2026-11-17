@@ -792,6 +792,7 @@ pub struct App {
     prefilled: Option<(ChatId, String)>,
     /// Actions queued by a backend event, applied on that account after the frame.
     deferred_account_actions: Vec<(AccountId, Action)>,
+    enterprise_ca_pending: Vec<(AccountId, Dialog)>,
     /// Set while the events of an account that is not on screen are being
     /// applied: they update that account only, never the window's composer,
     /// dialogs, playback, or read state.
@@ -1707,6 +1708,7 @@ impl App {
             composer_undo_epoch: 0,
             prefilled: None,
             deferred_account_actions: Vec::new(),
+            enterprise_ca_pending: Vec::new(),
             events_hidden: false,
             update: None,
             last_update_check: None,
@@ -2121,6 +2123,8 @@ impl App {
         self.accounts[index].backend.shutdown();
         // The backend ends its call on the way out; the surface goes with it.
         let removed = self.accounts[index].id.clone();
+        self.enterprise_ca_pending
+            .retain(|(account, _)| account != &removed);
         self.forget_call_of(&removed);
         let dirs = self.accounts[index].dirs.clone();
         // The key outlives the archive only by mistake: forget it once the
@@ -3653,6 +3657,26 @@ impl App {
         for index in removed.into_iter().rev() {
             self.finish_removed(index);
         }
+        self.show_pending_enterprise_ca();
+    }
+
+    fn show_pending_enterprise_ca(&mut self) {
+        if self.dialog.is_none()
+            && let Some((_, dialog)) = self
+                .enterprise_ca_pending
+                .iter()
+                .find(|(id, _)| id == &self.account().id)
+        {
+            self.dialog = Some(dialog.clone());
+        }
+    }
+
+    fn forget_pending_enterprise_ca(&mut self) {
+        if let Some(dialog @ Dialog::ConfirmEnterpriseCa { .. }) = &self.dialog {
+            let account = self.account().id.clone();
+            self.enterprise_ca_pending
+                .retain(|(id, pending)| id != &account || pending != dialog);
+        }
     }
 
     fn apply_backend_event(&mut self, event: Event, live: bool) {
@@ -3685,6 +3709,33 @@ impl App {
                     if stats.is_some() {
                         self.storage_stats = stats;
                     }
+                }
+            }
+            Event::EnterpriseCaApprovalRequired {
+                host,
+                root,
+                certificate,
+                retry,
+            } => {
+                if crate::enterprise_ca::EnterpriseCaTrust::load(&self.dirs.enterprise_ca_file())
+                    .is_ok_and(|trust| trust.is_approved(&root))
+                {
+                    self.backend.send(Command::ApproveEnterpriseCa { root, retry });
+                    return;
+                }
+                let dialog = Dialog::ConfirmEnterpriseCa {
+                    host,
+                    root,
+                    certificate: Box::new(certificate),
+                    retry,
+                };
+                let account = self.account().id.clone();
+                if !self
+                    .enterprise_ca_pending
+                    .iter()
+                    .any(|pending| pending == &(account.clone(), dialog.clone()))
+                {
+                    self.enterprise_ca_pending.push((account, dialog));
                 }
             }
             Event::Blocklist { state, error } => {
@@ -5045,6 +5096,30 @@ impl App {
 
     /// Updates one account's link state, discarding its drafts when it is unlinked.
     fn handle_link(&mut self, status: LinkStatus, live: bool) {
+        if matches!(status, LinkStatus::Connected | LinkStatus::Connecting) {
+            let account = self.account().id.clone();
+            self.enterprise_ca_pending.retain(|(id, dialog)| {
+                id != &account
+                    || !matches!(
+                        dialog,
+                        Dialog::ConfirmEnterpriseCa {
+                            retry: crate::model::EnterpriseCaRetry::WhatsApp { .. },
+                            ..
+                        }
+                    )
+            });
+            if live
+                && matches!(
+                    self.dialog,
+                    Some(Dialog::ConfirmEnterpriseCa {
+                        retry: crate::model::EnterpriseCaRetry::WhatsApp { .. },
+                        ..
+                    })
+                )
+            {
+                self.dialog = None;
+            }
+        }
         // Only a drop after being connected is news; the startup sequence
         // (Starting, Connecting, Connected) stays silent. An account that is
         // not on screen is never announced.
@@ -7365,6 +7440,39 @@ impl App {
             return;
         }
         match action {
+            Action::ApproveEnterpriseCa { root, retry } => {
+                if !matches!(&self.dialog, Some(Dialog::ConfirmEnterpriseCa { root: current, retry: current_retry, .. }) if current == &root && current_retry == &retry) {
+                    return;
+                }
+                let mut retries = Vec::new();
+                self.enterprise_ca_pending.retain(|(account, dialog)| {
+                    if let Dialog::ConfirmEnterpriseCa { root: pending_root, retry, .. } = dialog
+                        && pending_root == &root
+                    {
+                        retries.push((account.clone(), retry.clone()));
+                        false
+                    } else { true }
+                });
+                self.dialog = None;
+                for (account, retry) in retries {
+                    if let Some(account) = self.accounts.iter().find(|entry| entry.id == account) {
+                        account.backend.send(Command::ApproveEnterpriseCa { root: root.clone(), retry });
+                    }
+                }
+            }
+            Action::CancelEnterpriseCa => {
+                if matches!(
+                    self.dialog,
+                    Some(Dialog::ConfirmEnterpriseCa {
+                        retry: crate::model::EnterpriseCaRetry::SignalSticker(_),
+                        ..
+                    })
+                ) {
+                    self.sticker_import_pending = false;
+                }
+                self.forget_pending_enterprise_ca();
+                self.dialog = None;
+            }
             Action::FetchBlocklist => self.backend.send(Command::FetchBlocklist),
             Action::SetBlocked { chat, blocked } => {
                 if self.is_connected() && self.blocklist.editable() {
@@ -9100,6 +9208,10 @@ impl App {
                 self.dialog = Some(dialog);
             }
             Action::CloseDialog => {
+                if matches!(self.dialog, Some(Dialog::ConfirmEnterpriseCa { .. })) {
+                    self.apply(Action::CancelEnterpriseCa, ctx);
+                    return;
+                }
                 if matches!(self.dialog, Some(Dialog::ExportChat { .. }))
                     && self.chat_export.is_some()
                 {
@@ -14477,6 +14589,42 @@ mod tests {
         app.accounts.push(second);
         app.active = 0;
         (app, commands)
+    }
+
+    #[test]
+    fn enterprise_ca_waits_for_its_account_and_cancel_keeps_the_failure() {
+        use crate::model::EnterpriseCaRetry;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, mut commands) = two_accounts(directory.path());
+        app.accounts[1].link = LinkStatus::Failed("certificate failure".into());
+        let root = crate::enterprise_ca::NativeRoot { der: vec![1], sha256: [1; 32] };
+        let certificate = crate::enterprise_ca::CertificateInfo { subject: "fixture".into(), issuer: "fixture".into(), not_before: "fixture".into(), not_after: "fixture".into(), sha256: [1; 32] };
+        let event = || Event::EnterpriseCaApprovalRequired {
+            host: "web.whatsapp.com".into(), root: root.clone(), certificate: certificate.clone(),
+            retry: EnterpriseCaRetry::WhatsApp { generation: 2, attempt: 3 },
+        };
+        app.dialog = Some(Dialog::Shortcuts);
+        app.active = 1;
+        app.apply_backend_event(event(), false);
+        app.active = 0;
+        app.show_pending_enterprise_ca();
+        assert_eq!(app.dialog, Some(Dialog::Shortcuts));
+        app.dialog = None;
+        app.switch_account(&AccountId::parse("2").unwrap());
+        app.show_pending_enterprise_ca();
+        assert!(matches!(app.dialog, Some(Dialog::ConfirmEnterpriseCa { .. })));
+        app.switch_account(&AccountId::parse("1").unwrap());
+        app.switch_account(&AccountId::parse("2").unwrap());
+        app.show_pending_enterprise_ca();
+        app.apply(Action::CloseDialog, &egui::Context::default());
+        assert!(app.enterprise_ca_pending.is_empty());
+        assert!(matches!(app.link, LinkStatus::Failed(_)));
+        assert!(!app.dirs.enterprise_ca_file().exists());
+        assert!(!std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::ApproveEnterpriseCa { .. })));
+        app.apply_backend_event(event(), true);
+        app.show_pending_enterprise_ca();
+        app.apply(Action::ApproveEnterpriseCa { root, retry: EnterpriseCaRetry::WhatsApp { generation: 2, attempt: 3 } }, &egui::Context::default());
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|command| matches!(command, Command::ApproveEnterpriseCa { retry: EnterpriseCaRetry::WhatsApp { generation: 2, attempt: 3 }, .. })));
     }
 
     #[test]
